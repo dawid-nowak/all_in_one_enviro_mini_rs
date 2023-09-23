@@ -2,6 +2,8 @@ use bme280::i2c::BME280;
 use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::digital::v2::PinState;
 use rppal::gpio::Gpio;
+use rppal::gpio::Level;
+use rppal::gpio::Trigger;
 use rppal::hal::Delay;
 use rppal::i2c::I2c;
 use rppal::spi::Bus;
@@ -26,6 +28,12 @@ use embedded_graphics::{
     prelude::*,
 };
 use ltr_559::{AlsGain, AlsIntTime, AlsMeasRate, Ltr559, SlaveAddr};
+use ltr_559::InterruptPinPolarity;
+use ltr_559::InterruptMode;
+use ltr_559::PsMeasRate;
+use ltr_559::LedPulse;
+use ltr_559::LedDutyCycle;
+use ltr_559::LedCurrent;
 use st7735_lcd::Orientation;
 use std::error::Error;
 use systemstat::{Platform, System};
@@ -62,32 +70,68 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     tracing::info!("Hello PI");
-    
+
     let sys = System::new();
 
     let spi = Spi::new(Bus::Spi0, SlaveSelect::Ss1, SPI_SPEED, SPIMode::Mode0)?;
     let gpio = Gpio::new()?;
     let dc = gpio.get(9)?.into_output();
+    let mut proximity = gpio.get(4)?.into_input_pullup();
+    proximity.set_async_interrupt(Trigger::FallingEdge, |c: Level| {
+        tracing::warn!("Got interrupt level {c:?}");
+    })?;
     let mut backlight = gpio.get(12)?.into_output();
 
     backlight.set_low();
     thread::sleep(Duration::from_millis(100));
     backlight.set_high();
     thread::sleep(Duration::from_millis(100));
-    
 
     let i2c = I2c::new()?;
     let mut bme280 = BME280::new_primary(i2c, Delay);
     bme280.init().unwrap();
 
-
     let i2c = I2c::new()?;
-    let mut sensor = Ltr559::new_device(i2c, SlaveAddr::default());
-    sensor
+    let mut light_sensor = Ltr559::new_device(i2c, SlaveAddr::default());
+    light_sensor.set_als_contr(AlsGain::Gain4x, true, false).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    light_sensor.reset_internal_driver_state();
+    thread::sleep(Duration::from_millis(100));
+    
+
+    let manufacturer_id = light_sensor.get_manufacturer_id().unwrap();
+    let part_id = light_sensor.get_part_id().unwrap();
+    
+    let als_status = light_sensor.get_als_contr().unwrap();
+    let ps_status = light_sensor.get_ps_contr().unwrap();
+    tracing::info!("Manufactured by {manufacturer_id:x} : {part_id:x} status {als_status:x} {ps_status:x}" );        
+    
+    light_sensor
+        .set_interrupt(InterruptPinPolarity::Low, InterruptMode::OnlyPS)
+        .unwrap();
+            
+    light_sensor.set_ps_led(LedPulse::Pulse30, LedDutyCycle::_100, LedCurrent::_50mA).unwrap();
+    light_sensor.set_ps_n_pulses(1).unwrap();
+    
+    light_sensor.set_als_contr(AlsGain::Gain4x, false, true).unwrap();
+    light_sensor
+        .set_ps_contr(true,true)
+        .unwrap();
+
+    
+    light_sensor.set_ps_meas_rate(PsMeasRate::_100ms).unwrap();
+    light_sensor
         .set_als_meas_rate(AlsIntTime::_50ms, AlsMeasRate::_50ms)
         .unwrap();
-    sensor.set_als_contr(AlsGain::Gain4x, false, true).unwrap();
-
+    
+    light_sensor.set_ps_offset(0).unwrap();
+    light_sensor.set_ps_low_limit_raw(0).unwrap();
+    light_sensor.set_ps_high_limit_raw(1000).unwrap();
+    
+    let als_status = light_sensor.get_als_contr().unwrap();
+    let ps_status = light_sensor.get_ps_contr().unwrap();
+    tracing::info!("Manufactured by {manufacturer_id:x} : {part_id:x} status {als_status:x} {ps_status:x}" );
+    
     let mut delay = Delay;
     let mut display = st7735_lcd::ST7735::new(spi, dc, NotConnected, false, true, 162, 132);
     display
@@ -137,19 +181,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         .draw(&mut display)
         .map_err(|_| "Can't draw")?;
 
-    
     loop {
-        let status = sensor.get_status().unwrap();
-
-        let (lux, proximity) = if status.als_data_valid {
-            let (_lux_raw_0, _lux_raw_1) = sensor.get_als_raw_data().unwrap();
-            let lux = sensor.get_lux().unwrap();
-            let proximity = sensor.get_ps_data().unwrap();
-            (Some(lux), Some(proximity))
+	thread::sleep(Duration::from_millis(1000));
+	
+        let status = light_sensor.get_status().unwrap();
+	
+        tracing::debug!("Light sensor status {status:?}");
+        let lux = if status.als_data_valid || status.als_interrupt_status {
+            let (_lux_raw_0, _lux_raw_1) = light_sensor.get_als_raw_data().unwrap();
+            let lux = light_sensor.get_lux().unwrap();            
+            Some(lux)
         } else {
             tracing::warn!("No lux");
-            (None, None)
+            None
         };
+
+	let proximity = if status.ps_data_status || status.ps_interrupt_status {
+            let proximity = light_sensor.get_ps_data().unwrap();
+            Some(proximity)
+        } else {
+            tracing::warn!("No prox");
+            None
+        };	
 
         let cpu_temp = match sys.cpu_temp() {
             Ok(cpu_temp) => Some(cpu_temp),
