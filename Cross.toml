@@ -1,0 +1,19 @@
+[target.armv7-unknown-linux-gnueabihf]
+#image = "dawid-armv7-unknown-linux-gnueabihf:0.1"
+
+pre-build = [
+"dpkg --add-architecture armv7 && apt-get update && apt-get install --assume-yes wget",
+"wget https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.9.tar.bz2",
+"tar xjf alsa-lib-1.2.9.tar.bz2",
+"cd alsa-lib-1.2.9",
+#"./configure -v --disable-shared --enable-static --with-pic --host arm-linux-gnueabihf",
+"./configure -v --enable-shared --with-pic --host arm-linux-gnueabihf",
+"make",
+"make install"
+]
+
+
+[build.env]
+passthrough = [
+    "RUST_BACKTRACE=1"
+]

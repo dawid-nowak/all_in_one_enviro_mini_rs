@@ -1,5 +1,5 @@
 [package]
-name = "all_in_one_enviro_mini"
+name = "all_in_one_enviro_mini_rs"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,10 +11,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bme280 = "0.3.0"
 systemstat = "0.2.3"
-ltr-559 = "0.1.1"
+ltr-559 = {version= "0.1.1", path = "../ltr-559"}
+#ltr-559 = {version= "0.1.1"}
 #st7735 = "0.1.0"
 st7735-lcd = { version = "0.9.0", path = "../st7735-lcd-rs"}
 embedded-hal = "0.2.5"
 embedded-graphics="0.8"
 embedded-graphics-core="0.4"
 embedded-canvas = { version = "0.2.0", path = "../embedded-canvas"}
+portaudio = { version = "0.7", path = "../rust-portaudio"}
