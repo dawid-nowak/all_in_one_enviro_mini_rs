@@ -50,7 +50,6 @@ use ltr_559::LedDutyCycle;
 use ltr_559::LedPulse;
 use ltr_559::PsMeasRate;
 use ltr_559::{AlsGain, AlsIntTime, AlsMeasRate, Ltr559, SlaveAddr};
-use portaudio as pa;
 use rand::Rng;
 use st7735_lcd::Orientation;
 use std::error::Error;
@@ -58,14 +57,10 @@ use systemstat::{Platform, System};
 use tinybmp::Bmp;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod audio;
+
 const DC_PIN: u8 = 9;
 const BACKLIGHT_PIN: u8 = 12;
-const INTERLEAVED: bool = true;
-const LATENCY: pa::Time = 0.0; // Ignored by PortAudio::is_*_format_supported.
-const STANDARD_SAMPLE_RATES: [f64; 13] = [
-    8000.0, 9600.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0, 44100.0, 48000.0,
-    88200.0, 96000.0, 192000.0,
-];
 
 const SPI_SPEED: u32 = 10_000_000;
 const DISPLAY_HORIZONTAL_OFFSET: i32 = 0;
@@ -130,18 +125,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let error = Arc::new(AtomicBool::new(false));
     let handler_error = error.clone();
     let handler_display = display.clone();
+    let audio = audio::Audio::new("adau7002")?;
 
     let _ = ctrlc::set_handler(move || {
-        if let Ok(mut disp) = handler_display.lock(){
-	    clear_display(&mut disp);
-	}
+        if let Ok(mut disp) = handler_display.lock() {
+            clear_display(&mut disp);
+        }
         std::process::exit(0);
     });
 
     let canvas = prepare_boot_page(DISPLAY_SIZE)?;
 
-    if let Ok(mut disp) = display.lock(){
-	canvas
+    if let Ok(mut disp) = display.lock() {
+        canvas
             .place_at(DISPLAY_OFFSET)
             .draw(&mut *disp)
             .map_err(|_| "Can't draw")?;
@@ -150,7 +146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     thread::sleep(Duration::from_millis(500));
 
     let mut screen_indicator = 0;
-    
+
     let guard = timer.schedule_repeating(ChronoDuration::milliseconds(500),move ||{
 
 	let mut timer_task = ||->Result<(), Box<dyn Error>>{
@@ -177,7 +173,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             if let Some(proximity) = proximity {
 		if proximity.0 > PROXIMITY_TRESHOLD {
                     screen_indicator += 1;
-		}
+		    audio.stop_audio();
+		}		
             }
 
             let cpu_temp = match sys.cpu_temp() {
@@ -191,7 +188,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let measurements = bme280.measure().map_err(|_| "Can't get measurements from bme280")?;
             let delta = cpu_temp.map(|temp| temp - measurements.temperature);
 
-            tracing::info!(
+            tracing::debug!(
 		"Lux {:?} Proximity {:?} Relative Humidity = {}% Sensor Temperature = {} CPU temp = {:?} delta {:?} deg C, Pressure = {} hPa",
 		lux,
 		proximity,
@@ -202,7 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		measurements.pressure / 100.0
             );
 
-            let page_canvas = match screen_indicator % 6 {
+            let page_canvas = match screen_indicator % 7 {
 		0 => prepare_all_sensors_page(
                     DISPLAY_SIZE,
                     measurements.pressure / 100.0,
@@ -232,6 +229,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 			prepare_error_page(DISPLAY_SIZE, "Error")?
                     }
 		}
+		6 => {
+		    if audio.start_audio().is_ok(){
+			prepare_noize_page(DISPLAY_SIZE)?
+		    }else{
+			prepare_error_page(DISPLAY_SIZE, "No Noise")?
+		    }		    
+		},
 
 		_ => prepare_error_page(DISPLAY_SIZE, "Error")?,
             };
@@ -254,17 +258,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-
-fn display_page(display: &Arc<Mutex<st7735_lcd::ST7735<Spi, rppal::gpio::OutputPin, NotConnected>>>, canvas: Canvas<Rgb565>)->Result<(), Box<dyn Error>>{
-    if let Ok(mut disp) = display.lock(){
-	let canvas_at = canvas.place_at(DISPLAY_OFFSET);
-	let bb = canvas_at.bounding_box();
-	let pixels_iter = bb.points().filter_map(|point| {
-	    canvas_at.get_pixel(point)
-	});
-	disp.fill_contiguous(&bb, pixels_iter).map_err(|_| "Can't draw".into())	
-    }else{
-	Err("Can't lock".into())
+fn display_page(
+    display: &Arc<Mutex<st7735_lcd::ST7735<Spi, rppal::gpio::OutputPin, NotConnected>>>,
+    canvas: Canvas<Rgb565>,
+) -> Result<(), Box<dyn Error>> {
+    if let Ok(mut disp) = display.lock() {
+        let canvas_at = canvas.place_at(DISPLAY_OFFSET);
+        let bb = canvas_at.bounding_box();
+        let pixels_iter = bb.points().filter_map(|point| canvas_at.get_pixel(point));
+        disp.fill_contiguous(&bb, pixels_iter)
+            .map_err(|_| "Can't draw".into())
+    } else {
+        Err("Can't lock".into())
     }
 }
 
@@ -337,7 +342,6 @@ fn start_display(gpio: &Gpio) -> Result<rppal::gpio::OutputPin, Box<dyn Error>> 
     thread::sleep(Duration::from_millis(100));
     Ok(backlight)
 }
-
 
 fn init_display(
     gpio: &Gpio,
@@ -541,6 +545,10 @@ fn prepare_error_page(size: Size, name: &str) -> Result<Canvas<Rgb565>, Box<dyn 
     Ok(canvas)
 }
 
+fn prepare_noize_page(size: Size) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
+    prepare_error_page(size, "Noise")
+}
+
 fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
     let w = size.width;
     let h = size.height;
@@ -599,69 +607,4 @@ fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<d
     canvas.fill_contiguous(&area, pixel_colors)?;
     //.draw_iter(pixels)?;
     Ok(canvas)
-}
-
-fn check_audio() -> Result<(), Box<dyn Error>> {
-    let pa = pa::PortAudio::new()?;
-    tracing::info!("PortAudio version: {} {}", pa.version(), pa.version_text()?);
-    let host_count = pa.host_api_count()?;
-    tracing::info!("PortAudio host count {host_count}");
-    let default_host = pa.default_host_api();
-    let default_input = pa.default_input_device();
-    //    let input_info = pa.device_info(default_input);
-
-    tracing::info!("PortAudio host count {host_count:?} {default_host:?} {default_input:?}");
-    //    tracing::info!("PortAudio default input device info: {:#?}", &input_info);
-    let devices = pa.device_count()?;
-    tracing::info!("Devices {devices}");
-    for device in pa.devices()? {
-        let (idx, info) = device?;
-        tracing::info!("--------------------------------------- {:?}", idx);
-        tracing::info!("{:#?}", &info);
-
-        let in_channels = info.max_input_channels;
-        let input_params = pa::StreamParameters::<i16>::new(idx, in_channels, INTERLEAVED, LATENCY);
-        let out_channels = info.max_output_channels;
-        let output_params =
-            pa::StreamParameters::<i16>::new(idx, out_channels, INTERLEAVED, LATENCY);
-
-        tracing::info!(
-            "Supported standard sample rates for half-duplex 16-bit {} channel input:",
-            in_channels
-        );
-        for &sample_rate in &STANDARD_SAMPLE_RATES {
-            if pa
-                .is_input_format_supported(input_params, sample_rate)
-                .is_ok()
-            {
-                tracing::info!("\t{}hz", sample_rate);
-            }
-        }
-
-        tracing::info!(
-            "Supported standard sample rates for half-duplex 16-bit {} channel output:",
-            out_channels
-        );
-        for &sample_rate in &STANDARD_SAMPLE_RATES {
-            if pa
-                .is_output_format_supported(output_params, sample_rate)
-                .is_ok()
-            {
-                tracing::info!("\t{}hz", sample_rate);
-            }
-        }
-
-        tracing::info!("Supported standard sample rates for full-duplex 16-bit {} channel input, {} channel output:",
-                 in_channels, out_channels);
-        for &sample_rate in &STANDARD_SAMPLE_RATES {
-            if pa
-                .is_duplex_format_supported(input_params, output_params, sample_rate)
-                .is_ok()
-            {
-                tracing::info!("\t{}hz", sample_rate);
-            }
-        }
-    }
-
-    Ok(())
 }

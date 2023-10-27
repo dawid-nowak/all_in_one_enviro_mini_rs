@@ -15,6 +15,8 @@
 
 
 
+/usr/bin/docker run --userns host -e 'RUST_BACKTRACE=1' -e 'PKG_CONFIG_ALLOW_CROSS=1' -e 'XARGO_HOME=/xargo' -e 'CARGO_HOME=/cargo' -e 'CARGO_TARGET_DIR=/target' -e 'CROSS_RUNNER=' -e TERM -e 'USER=dawid' -v /home/dawid/Workspace/pi/enviroplus-rust/rust-portaudio/rust-portaudio-sys:/home/dawid/Workspace/pi/enviroplus-rust/rust-portaudio/rust-portaudio-sys --user 1000:1000 -v /home/dawid/.xargo:/xargo:z -v /home/dawid/.cargo:/cargo:z -v /cargo/bin -v /home/dawid/Workspace/pi/enviroplus-rust/rust-portaudio:/home/dawid/Workspace/pi/enviroplus-rust/rust-portaudio:z -v /home/dawid/.rustup/toolchains/stable-x86_64-unknown-linux-gnu:/rust:z,ro -v /home/dawid/Workspace/pi/enviroplus-rust/rust-portaudio/target:/target:z -w /home/dawid/Workspace/pi/enviroplus-rust/rust-portaudio -i -t cross-custom-rust-portaudio:armv7-unknown-linux-gnueabihf-b3ce6-pre-build sh -c 'PATH=$PATH:/rust/bin cargo -v build --target armv7-unknown-linux-gnueabihf'
+
 
 ```
 
