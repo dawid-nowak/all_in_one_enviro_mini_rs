@@ -10,28 +10,37 @@ use std::thread;
 const INTERLEAVED: bool = true;
 const SAMPLE_RATE: u32 = 44_100;
 const CHANNELS: u16 = 1;
-const FRAMES: u32 = 1024;
+pub(crate) const FRAMES: u32 = 1024;
 
-pub struct Audio {
+pub struct Audio<F>
+where
+    F: Fn(Vec<f32>) -> Result<(), Box<dyn Error>> + std::marker::Sync + std::marker::Send,
+{
     device_name: String,
     is_started: Arc<AtomicBool>,
+    handler: Arc<F>,
 }
 
-impl Audio {
-    pub fn new(input_device_name: &str) -> Result<Self, Box<dyn Error>> {
+impl<F> Audio<F>
+where
+    F: Fn(Vec<f32>) -> Result<(), Box<dyn Error>> + std::marker::Sync + std::marker::Send + 'static,
+{
+    pub fn new(input_device_name: &str, handler: F) -> Result<Self, Box<dyn Error>>
+where {
         Ok(Self {
             device_name: String::from(input_device_name),
             is_started: Arc::new(AtomicBool::new(false)),
+            handler: Arc::new(handler),
         })
     }
 
     pub fn start_audio(&self) -> Result<(), Box<dyn Error>> {
         let input_device_name = &self.device_name;
-        tracing::info!("Starting audio {:?}", self.is_started);
         if self.is_started.load(Ordering::Relaxed) {
             return Ok(());
         }
 
+        tracing::info!("Starting audio");
         let (pa, settings) = Self::initialize(input_device_name)?;
         let (sender, receiver) = ::std::sync::mpsc::sync_channel(100);
 
@@ -56,13 +65,14 @@ impl Audio {
             } else {
                 tracing::warn!("Stream completed  {still_running:?}");
                 let _ = sender.send((time.current, 0, vec![]));
-                pa::Complete
+                pa::Abort
             }
         };
 
         let thread_pa = pa;
         let thread_settings = settings;
         let thread_is_started = self.is_started.clone();
+        let external_handler = self.handler.clone();
         let _handler = Arc::new(thread::spawn(move || {
             'end_of_recording: while let Ok(mut stream) =
                 thread_pa.open_non_blocking_stream(thread_settings, callback.clone())
@@ -71,14 +81,15 @@ impl Audio {
                 thread_is_started.store(true, Ordering::Relaxed);
                 let Ok(_) = stream.start() else { continue };
                 while let Ok(true) = stream.is_active() {
-                    while let Ok((current_time, len, samples)) = receiver.recv() {
-                        if len != 0 {
-                            tracing::debug!(
-                                "Processing data {len} {current_time:?} {:x?}",
-                                &samples[0..10]
-                            );
-                        } else {
+                    while let Ok((_current_time, len, samples)) = receiver.recv() {
+                        if len == 0 {
                             tracing::warn!("Stream is dead");
+                            break 'end_of_recording;
+                        }
+
+                        let res = (external_handler)(samples);
+                        if res.is_err() {
+                            tracing::warn!("Hnadler throw an error {res:?}");
                             break 'end_of_recording;
                         }
                     }
@@ -97,7 +108,7 @@ impl Audio {
     }
 
     pub fn stop_audio(&self) {
-        tracing::info!("Stopping audio {:?}", self.is_started);
+        tracing::debug!("Stopping audio {:?}", self.is_started);
         self.is_started.store(false, Ordering::Relaxed);
     }
 

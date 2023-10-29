@@ -9,12 +9,10 @@ use plotters::prelude::BitMapBackend;
 use plotters::prelude::ChartBuilder;
 use plotters::prelude::IntoDrawingArea;
 use plotters::series::LineSeries;
-use plotters::style::RED;
+use plotters::style::{GREEN,RED};
 use ringbuffer::AllocRingBuffer;
 use ringbuffer::RingBuffer;
 use rppal::gpio::Gpio;
-use rppal::gpio::Level;
-use rppal::gpio::Trigger;
 use rppal::hal::Delay;
 use rppal::i2c::I2c;
 use rppal::spi::Bus;
@@ -50,7 +48,6 @@ use ltr_559::LedDutyCycle;
 use ltr_559::LedPulse;
 use ltr_559::PsMeasRate;
 use ltr_559::{AlsGain, AlsIntTime, AlsMeasRate, Ltr559, SlaveAddr};
-use rand::Rng;
 use st7735_lcd::Orientation;
 use std::error::Error;
 use systemstat::{Platform, System};
@@ -99,7 +96,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     tracing::info!("Hello PI");
-    //    check_audio()?;
 
     let sys = System::new();
     let gpio = Gpio::new()?;
@@ -109,24 +105,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut light_sensor = init_light_sensor(I2c::new()?)?;
     let display = Arc::new(Mutex::new(init_display(&gpio)?));
 
-    let buffer_out = Arc::new(Mutex::new(AllocRingBuffer::new(320)));
+    let mut rb = AllocRingBuffer::new(audio::FRAMES as usize);
+    rb.fill(0.0_f32);
+    let buffer_out = Arc::new(Mutex::new(rb));
     let buffer_in = buffer_out.clone();
-    let _handler = Arc::new(thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(500));
-        tracing::debug!("Producing data");
-        let between = rand::distributions::Uniform::from(-40..40);
-        let sample: Vec<i8> = rand::thread_rng().sample_iter(&between).take(40).collect();
-        if let Ok(mut buf) = buffer_out.lock() {
-            buf.extend(sample);
-        }
-    }));
 
     let timer = Timer::new();
     let error = Arc::new(AtomicBool::new(false));
     let handler_error = error.clone();
     let handler_display = display.clone();
-    let audio = audio::Audio::new("adau7002")?;
 
+    let audio = audio::Audio::new("adau7002", move |sample:Vec<f32>|->Result<(), Box<dyn Error>>{
+	//tracing::info!("got sample {:?}", &sample[..10]);
+	if let Ok(mut buf) = buffer_out.lock() {
+	    //	    sample.iter().for_each(|s| buf.push(*s));
+	    buf.extend(sample);
+        }	
+	Ok(())
+    })?;
+    
     let _ = ctrlc::set_handler(move || {
         if let Ok(mut disp) = handler_display.lock() {
             clear_display(&mut disp);
@@ -134,25 +131,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(0);
     });
 
-    let canvas = prepare_boot_page(DISPLAY_SIZE)?;
-
-    if let Ok(mut disp) = display.lock() {
-        canvas
-            .place_at(DISPLAY_OFFSET)
-            .draw(&mut *disp)
-            .map_err(|_| "Can't draw")?;
-    }
-
+    display_page(&display, prepare_boot_page(DISPLAY_SIZE)?)?;
+    
     thread::sleep(Duration::from_millis(500));
 
     let mut screen_indicator = 0;
 
     let guard = timer.schedule_repeating(ChronoDuration::milliseconds(500),move ||{
-
 	let mut timer_task = ||->Result<(), Box<dyn Error>>{
-            let status = light_sensor.get_status().map_err(|e| "Can't get light sensor status")?;
-
-            tracing::debug!("Light sensor status {status:?}");
+            let status = light_sensor.get_status().map_err(|_e| "Can't get light sensor status")?;
             let lux = if status.als_data_valid || status.als_interrupt_status {
 		let (_lux_raw_0, _lux_raw_1) = light_sensor.get_als_raw_data().map_err(|_| "Can't get light raw data")?;
 		let lux = light_sensor.get_lux().map_err(|_| "Can't get light lux")?;
@@ -188,7 +175,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let measurements = bme280.measure().map_err(|_| "Can't get measurements from bme280")?;
             let delta = cpu_temp.map(|temp| temp - measurements.temperature);
 
-            tracing::debug!(
+            tracing::trace!(
 		"Lux {:?} Proximity {:?} Relative Humidity = {}% Sensor Temperature = {} CPU temp = {:?} delta {:?} deg C, Pressure = {} hPa",
 		lux,
 		proximity,
@@ -199,7 +186,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		measurements.pressure / 100.0
             );
 
-            let page_canvas = match screen_indicator % 7 {
+            let page_canvas = match screen_indicator % 6 {
 		0 => prepare_all_sensors_page(
                     DISPLAY_SIZE,
                     measurements.pressure / 100.0,
@@ -222,25 +209,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 		3 => prepare_sensor_page(DISPLAY_SIZE, "Humidity", measurements.humidity, "%")?,
 		4 => prepare_sensor_page(DISPLAY_SIZE, "Brightness", lux.unwrap_or(f32::NAN), "lux")?,
 		5 => {
-                    if let Ok(buf) = buffer_in.lock() {
-			let data = buf.to_vec();
-			prepare_chart_page(DISPLAY_SIZE, &data)?
-                    } else {
+		    if audio.start_audio().is_err(){
 			prepare_error_page(DISPLAY_SIZE, "Error")?
-                    }
-		}
-		6 => {
-		    if audio.start_audio().is_ok(){
-			prepare_noize_page(DISPLAY_SIZE)?
-		    }else{
-			prepare_error_page(DISPLAY_SIZE, "No Noise")?
-		    }		    
+		    }else if let Ok(buf) = buffer_in.lock() {
+			    let data: Vec<f32> = buf.to_vec();
+			    prepare_noise_chart_page(DISPLAY_SIZE, &data)?
+		    } else {
+			prepare_error_page(DISPLAY_SIZE, "Error")?
+		    }					    		    
 		},
 
 		_ => prepare_error_page(DISPLAY_SIZE, "Error")?,
             };
 	    
-	    display_page(&display, page_canvas)?;	    	    
+	    display_page(&display, page_canvas)?;
 	    Ok(())
 	};
 	
@@ -372,13 +354,7 @@ fn clear_display(display: &mut st7735_lcd::ST7735<Spi, rppal::gpio::OutputPin, N
     }
 }
 
-fn register_proximity_callback(gpio: &Gpio) -> Result<(), Box<dyn Error>> {
-    let mut proximity = gpio.get(4)?.into_input_pullup();
-    proximity.set_async_interrupt(Trigger::FallingEdge, |c: Level| {
-        tracing::warn!("Got interrupt level {c:?}");
-    })?;
-    Ok(())
-}
+
 
 fn prepare_boot_page(size: Size) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
     let rust_logo = include_bytes!("./rust-logo_80x80.bmp");
@@ -504,7 +480,6 @@ fn prepare_sensor_page(
         .arrange();
     let lv = LinearLayout::vertical(Chain::new(t1).append(ll))
         .with_alignment(horizontal::Left)
-        //        .with_spacing(DistributeFill(size.height - 10))
         .arrange();
 
     let bounding_box = Rectangle::new(Point::new(0, 0), Size::new(size.width, size.height));
@@ -545,11 +520,10 @@ fn prepare_error_page(size: Size, name: &str) -> Result<Canvas<Rgb565>, Box<dyn 
     Ok(canvas)
 }
 
-fn prepare_noize_page(size: Size) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-    prepare_error_page(size, "Noise")
-}
 
-fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
+
+
+fn prepare_noise_chart_page(size: Size, sample: &[f32]) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
     let w = size.width;
     let h = size.height;
     let pixel_size = <RGBPixel as PixelFormat>::EFFECTIVE_PIXEL_SIZE as u32;
@@ -557,8 +531,6 @@ fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<d
     let mut buffer = vec![0; (w * h * pixel_size) as usize];
     {
         let root = BitMapBackend::with_buffer(&mut buffer, (w, h)).into_drawing_area();
-        //        root.fill(&BLACK).unwrap();
-
         let mut chart_builder = ChartBuilder::on(&root);
 
         chart_builder.margin(0);
@@ -566,25 +538,22 @@ fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<d
         chart_builder.margin_top(0);
         chart_builder.set_left_and_bottom_label_area_size(0);
         chart_builder.set_all_label_area_size(0);
-        let c = h as i32;
-        let mut chart_context = chart_builder.build_cartesian_2d(0..320_u32, -c / 2..c / 2)?;
+        let mut chart_context = chart_builder.build_cartesian_2d(0..sample.len() as u32, -1.0_f32..1.0_f32 )?;
 
         chart_context.configure_mesh().disable_mesh().draw()?;
 
-        let data: Vec<(u32, i32)> = sample
+        let data: Vec<(u32, f32)> = sample
             .iter()
             .enumerate()
-            .map(|(i, s)| (i as u32, *s as i32))
-            //            .filter(|s| s.0 % 5 == 0)
+            .map(|(i, s)| (i as u32, *s))  
             .collect();
-        let ls = LineSeries::new(data, RED);
+        let ls = LineSeries::new(data, GREEN);
         chart_context.draw_series(ls)?;
         root.present()?;
     }
 
     let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-
-    //    let mut pixels = vec![];
+    
     let mut pixel_colors = vec![];
     for i in 0..h {
         for j in 0..w {
@@ -596,15 +565,82 @@ fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<d
             );
             if let (Some(r), Some(b), Some(g)) = colors {
                 let pixel_color = Rgb565::new(*r, *g, *b);
-                //                pixels.push(Pixel(Point::new(j as i32, i as i32), pixel_color));
                 pixel_colors.push(pixel_color);
             } else {
-                println!("No colors at pos {i} {j} {pos}");
+                tracing::warn!("No colors at pos {i} {j} {pos}");
             }
         }
     }
     let area = Rectangle::new(Point::new(0, 0), size);
     canvas.fill_contiguous(&area, pixel_colors)?;
-    //.draw_iter(pixels)?;
     Ok(canvas)
 }
+
+
+// fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
+//     let w = size.width;
+//     let h = size.height;
+//     let pixel_size = <RGBPixel as PixelFormat>::EFFECTIVE_PIXEL_SIZE as u32;
+
+//     let mut buffer = vec![0; (w * h * pixel_size) as usize];
+//     {
+//         let root = BitMapBackend::with_buffer(&mut buffer, (w, h)).into_drawing_area();
+//         //        root.fill(&BLACK).unwrap();
+
+//         let mut chart_builder = ChartBuilder::on(&root);
+
+//         chart_builder.margin(0);
+//         chart_builder.margin_bottom(0);
+//         chart_builder.margin_top(0);
+//         chart_builder.set_left_and_bottom_label_area_size(0);
+//         chart_builder.set_all_label_area_size(0);
+//         let c = h as i32;
+//         let mut chart_context = chart_builder.build_cartesian_2d(0..320_u32, -c / 2..c / 2)?;
+
+//         chart_context.configure_mesh().disable_mesh().draw()?;
+
+//         let data: Vec<(u32, i32)> = sample
+//             .iter()
+//             .enumerate()
+//             .map(|(i, s)| (i as u32, *s as i32))
+//             //            .filter(|s| s.0 % 5 == 0)
+//             .collect();
+//         let ls = LineSeries::new(data, RED);
+//         chart_context.draw_series(ls)?;
+//         root.present()?;
+//     }
+
+//     let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
+
+//     //    let mut pixels = vec![];
+//     let mut pixel_colors = vec![];
+//     for i in 0..h {
+//         for j in 0..w {
+//             let pos = (i * w + j) * pixel_size;
+//             let colors = (
+//                 buffer.get(pos as usize),
+//                 buffer.get((pos + 1) as usize),
+//                 buffer.get((pos + 2) as usize),
+//             );
+//             if let (Some(r), Some(b), Some(g)) = colors {
+//                 let pixel_color = Rgb565::new(*r, *g, *b);
+//                 //                pixels.push(Pixel(Point::new(j as i32, i as i32), pixel_color));
+//                 pixel_colors.push(pixel_color);
+//             } else {
+//                 println!("No colors at pos {i} {j} {pos}");
+//             }
+//         }
+//     }
+//     let area = Rectangle::new(Point::new(0, 0), size);
+//     canvas.fill_contiguous(&area, pixel_colors)?;
+//     //.draw_iter(pixels)?;
+//     Ok(canvas)
+// }
+
+// fn register_proximity_callback(gpio: &Gpio) -> Result<(), Box<dyn Error>> {
+//     let mut proximity = gpio.get(4)?.into_input_pullup();
+//     proximity.set_async_interrupt(Trigger::FallingEdge, |c: Level| {
+//         tracing::warn!("Got interrupt level {c:?}");
+//     })?;
+//     Ok(())
+// }
