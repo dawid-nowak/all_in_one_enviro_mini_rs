@@ -108,7 +108,6 @@ where {
     }
 
     pub fn stop_audio(&self) {
-        tracing::debug!("Stopping audio {:?}", self.is_started);
         self.is_started.store(false, Ordering::Relaxed);
     }
 

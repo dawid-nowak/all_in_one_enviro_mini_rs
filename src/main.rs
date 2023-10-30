@@ -1,15 +1,7 @@
 use bme280::i2c::BME280;
 use chrono::Duration as ChronoDuration;
-use embedded_graphics::image::Image;
 use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::digital::v2::PinState;
-use plotters::backend::PixelFormat;
-use plotters::backend::RGBPixel;
-use plotters::prelude::BitMapBackend;
-use plotters::prelude::ChartBuilder;
-use plotters::prelude::IntoDrawingArea;
-use plotters::series::LineSeries;
-use plotters::style::{GREEN,RED};
 use ringbuffer::AllocRingBuffer;
 use ringbuffer::RingBuffer;
 use rppal::gpio::Gpio;
@@ -27,20 +19,16 @@ use std::thread;
 use systemstat::Duration;
 use timer::Timer;
 
-use eg_seven_segment::SevenSegmentStyleBuilder;
 use embedded_canvas::Canvas;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::Size;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::pixelcolor::RgbColor;
-use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
-use embedded_graphics::text::Text;
+
 use embedded_graphics::{
-    mono_font::{iso_8859_16::FONT_10X20, iso_8859_16::FONT_6X10, MonoTextStyle},
     prelude::*,
 };
-use embedded_layout::layout::linear::spacing::DistributeFill;
-use embedded_layout::{layout::linear::LinearLayout, prelude::*};
+
 use ltr_559::InterruptMode;
 use ltr_559::InterruptPinPolarity;
 use ltr_559::LedCurrent;
@@ -51,11 +39,11 @@ use ltr_559::{AlsGain, AlsIntTime, AlsMeasRate, Ltr559, SlaveAddr};
 use st7735_lcd::Orientation;
 use std::error::Error;
 use systemstat::{Platform, System};
-use tinybmp::Bmp;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 mod audio;
+mod pages;
 
+use pages::PageTypes;
 const DC_PIN: u8 = 9;
 const BACKLIGHT_PIN: u8 = 12;
 
@@ -87,6 +75,7 @@ impl OutputPin for NotConnected {
     }
 }
 
+
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -107,23 +96,26 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut rb = AllocRingBuffer::new(audio::FRAMES as usize);
     rb.fill(0.0_f32);
-    let buffer_out = Arc::new(Mutex::new(rb));
-    let buffer_in = buffer_out.clone();
+    let buffer_producer = Arc::new(Mutex::new(rb));
+    let buffer_consumer = buffer_producer.clone();
 
     let timer = Timer::new();
     let error = Arc::new(AtomicBool::new(false));
     let handler_error = error.clone();
     let handler_display = display.clone();
 
-    let audio = audio::Audio::new("adau7002", move |sample:Vec<f32>|->Result<(), Box<dyn Error>>{
-	//tracing::info!("got sample {:?}", &sample[..10]);
-	if let Ok(mut buf) = buffer_out.lock() {
-	    //	    sample.iter().for_each(|s| buf.push(*s));
-	    buf.extend(sample);
-        }	
-	Ok(())
-    })?;
-    
+    let audio = audio::Audio::new(
+        "adau7002",
+        move |sample: Vec<f32>| -> Result<(), Box<dyn Error>> {
+            //tracing::info!("got sample {:?}", &sample[..10]);
+            if let Ok(mut buf) = buffer_producer.lock() {
+                //	    sample.iter().for_each(|s| buf.push(*s));
+                buf.extend(sample);
+            }
+            Ok(())
+        },
+    )?;
+
     let _ = ctrlc::set_handler(move || {
         if let Ok(mut disp) = handler_display.lock() {
             clear_display(&mut disp);
@@ -131,13 +123,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(0);
     });
 
-    display_page(&display, prepare_boot_page(DISPLAY_SIZE)?)?;
+    let pages = pages::Pages::new(DISPLAY_SIZE);
+    
+    display_page(&display, pages.draw_page(&PageTypes::Boot)?)?;
     
     thread::sleep(Duration::from_millis(500));
-
-    let mut screen_indicator = 0;
-
+    let mut page_selector = PageTypes::Error("Start");
+    
+    
     let guard = timer.schedule_repeating(ChronoDuration::milliseconds(500),move ||{
+
 	let mut timer_task = ||->Result<(), Box<dyn Error>>{
             let status = light_sensor.get_status().map_err(|_e| "Can't get light sensor status")?;
             let lux = if status.als_data_valid || status.als_interrupt_status {
@@ -157,14 +152,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		None
             };
 
-            if let Some(proximity) = proximity {
-		if proximity.0 > PROXIMITY_TRESHOLD {
-                    screen_indicator += 1;
-		    audio.stop_audio();
-		}		
-            }
-
-            let cpu_temp = match sys.cpu_temp() {
+	    let cpu_temp = match sys.cpu_temp() {
 		Ok(cpu_temp) => Some(cpu_temp),
 		Err(x) => {
                     tracing::warn!("CPU temp: {}", x);
@@ -172,10 +160,67 @@ fn main() -> Result<(), Box<dyn Error>> {
 		}
             };
 
-            let measurements = bme280.measure().map_err(|_| "Can't get measurements from bme280")?;
+            let measurements: bme280::Measurements<rppal::i2c::Error> = bme280.measure().map_err(|_| "Can't get measurements from bme280")?;
             let delta = cpu_temp.map(|temp| temp - measurements.temperature);
 
-            tracing::trace!(
+	    let pressure = measurements.pressure;
+	    let temperature = measurements.temperature;
+	    let humidity = measurements.humidity;
+
+            if let Some(proximity) = proximity {
+		if proximity.0 > PROXIMITY_TRESHOLD {
+		    page_selector = match page_selector {
+			PageTypes::All(_) => PageTypes::Temperature(temperature),
+			PageTypes::Temperature(_) => PageTypes::Pressure(pressure),
+			PageTypes::Pressure(_) => PageTypes::Humidity(humidity),
+			PageTypes::Humidity(_) => PageTypes::Brightness(lux),
+			PageTypes::Brightness(_) =>
+			{
+			    if audio.start_audio().is_err(){
+				PageTypes::Error("Error")
+			    }else{
+				let data = if let Ok(buf) = buffer_consumer.lock() {
+				    buf.to_vec()
+				}else{
+				    vec![]
+				};
+				PageTypes::Noise(data)
+			    }		    
+			},
+			PageTypes::Noise(_) => PageTypes::All((pressure, temperature, humidity, lux)),
+			PageTypes::Error(_) => PageTypes::All((pressure, temperature, humidity, lux)),
+			PageTypes::Boot => PageTypes::All((pressure, temperature, humidity, lux)),
+			
+		    };
+		    tracing::info!("Selected page {page_selector}");
+		    audio.stop_audio();
+		}else{
+		    page_selector = match page_selector {
+			PageTypes::All(_) => PageTypes::All((pressure, temperature, humidity, lux)),
+			PageTypes::Temperature(_) => PageTypes::Temperature(temperature),
+			PageTypes::Pressure(_) => PageTypes::Pressure(pressure),
+			PageTypes::Humidity(_) => PageTypes::Humidity(humidity),
+			PageTypes::Brightness(_) => PageTypes::Brightness(lux),
+			PageTypes::Noise(_) => {
+			    if audio.start_audio().is_err(){
+				PageTypes::Error("Error")
+			    }else{
+				let data = if let Ok(buf) = buffer_consumer.lock() {
+				    buf.to_vec()
+				}else{
+				    vec![]
+				};
+				PageTypes::Noise(data)
+			    }
+			}
+			PageTypes::Error(_) => PageTypes::All((pressure, temperature, humidity, lux)),
+			PageTypes::Boot => PageTypes::Boot,
+		    };
+		};
+	    };
+
+	    
+	    tracing::trace!(
 		"Lux {:?} Proximity {:?} Relative Humidity = {}% Sensor Temperature = {} CPU temp = {:?} delta {:?} deg C, Pressure = {} hPa",
 		lux,
 		proximity,
@@ -185,43 +230,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 		delta,
 		measurements.pressure / 100.0
             );
+	    	    
 
-            let page_canvas = match screen_indicator % 6 {
-		0 => prepare_all_sensors_page(
-                    DISPLAY_SIZE,
-                    measurements.pressure / 100.0,
-                    measurements.temperature,
-                    measurements.humidity,
-                    lux.unwrap_or(f32::NAN),
-		)?,
-		1 => prepare_sensor_page(
-                    DISPLAY_SIZE,
-                    "Temperature",
-                    measurements.temperature,
-                    "\u{00B0}C",
-		)?,
-		2 => prepare_sensor_page(
-                    DISPLAY_SIZE,
-                    "Pressure",
-                    measurements.pressure / 100.0,
-                    "hPa",
-		)?,
-		3 => prepare_sensor_page(DISPLAY_SIZE, "Humidity", measurements.humidity, "%")?,
-		4 => prepare_sensor_page(DISPLAY_SIZE, "Brightness", lux.unwrap_or(f32::NAN), "lux")?,
-		5 => {
-		    if audio.start_audio().is_err(){
-			prepare_error_page(DISPLAY_SIZE, "Error")?
-		    }else if let Ok(buf) = buffer_in.lock() {
-			    let data: Vec<f32> = buf.to_vec();
-			    prepare_noise_chart_page(DISPLAY_SIZE, &data)?
-		    } else {
-			prepare_error_page(DISPLAY_SIZE, "Error")?
-		    }					    		    
-		},
-
-		_ => prepare_error_page(DISPLAY_SIZE, "Error")?,
-            };
-	    
+	    let page_canvas = pages.draw_page(&page_selector)?;
+	    	    
 	    display_page(&display, page_canvas)?;
 	    Ok(())
 	};
@@ -356,291 +368,3 @@ fn clear_display(display: &mut st7735_lcd::ST7735<Spi, rppal::gpio::OutputPin, N
 
 
 
-fn prepare_boot_page(size: Size) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-    let rust_logo = include_bytes!("./rust-logo_80x80.bmp");
-    let pimoroni_logo = include_bytes!("./pimoroni-logo_80x80.bmp");
-    let rust_image =
-        Bmp::from_slice(rust_logo).map_err(|e| format!("Can't open Rust image {:?}", e))?;
-    let pimoroni_image =
-        Bmp::from_slice(pimoroni_logo).map_err(|e| format!("Can't open Pimoroni image {:?}", e))?;
-    let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-
-    Image::new(&rust_image, Point::new(0, 0)).draw(&mut canvas)?;
-    Image::new(&pimoroni_image, Point::new(80, 0)).draw(&mut canvas)?;
-    Ok(canvas)
-}
-
-fn sensor_canvas(
-    size: Size,
-    name: &str,
-    value: f32,
-    unit: &str,
-) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-    let style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
-    let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-    let val = format!("{value:9.2}");
-
-    let t1 = Text::new(name, Point::zero(), style);
-    let t2 = Text::new(&val, Point::zero(), style);
-    let t3 = Text::new(unit, Point::zero(), style);
-
-    let ll = LinearLayout::horizontal(Chain::new(t1).append(t2).append(t3))
-        .with_alignment(vertical::Center)
-        .with_spacing(DistributeFill(size.width - 10))
-        .arrange();
-
-    let style = PrimitiveStyleBuilder::new()
-        .stroke_color(Rgb565::WHITE)
-        .stroke_width(1)
-        .build();
-
-    let bounding_box = Rectangle::new(Point::new(5, 5), Size::new(size.width - 5, size.height - 5));
-    let rect = Rectangle::new(Point::new(0, 0), size).into_styled(style);
-
-    ll.align_to(&bounding_box, horizontal::Left, vertical::Center)
-        .draw(&mut canvas)?;
-    rect.draw(&mut canvas)?;
-
-    Ok(canvas)
-}
-
-fn prepare_all_sensors_page(
-    size: Size,
-    pressure: f32,
-    temperature: f32,
-    humidity: f32,
-    brightness: f32,
-) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-    let style = PrimitiveStyleBuilder::new()
-        .stroke_color(Rgb565::WHITE)
-        .stroke_width(4)
-        .build();
-
-    let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-    let pressure = sensor_canvas(Size::new(size.width, 20), "Pressure", pressure, "hPa")?;
-    let brightness = sensor_canvas(Size::new(size.width, 20), "Brightness", brightness, "Lux")?;
-    let temperature = sensor_canvas(
-        Size::new(size.width, 20),
-        "Temperature",
-        temperature,
-        "\u{00b0}C",
-    )?;
-    let humidity = sensor_canvas(Size::new(size.width, 20), "Humidity", humidity, "%")?;
-    temperature
-        .place_at(Point::new(0, 00))
-        .draw(&mut canvas)
-        .map_err(|_| "Can't draw")?;
-    pressure
-        .place_at(Point::new(0, 20))
-        .draw(&mut canvas)
-        .map_err(|_| "Can't draw")?;
-    humidity
-        .place_at(Point::new(0, 40))
-        .draw(&mut canvas)
-        .map_err(|_| "Can't draw")?;
-    brightness
-        .place_at(Point::new(0, 60))
-        .draw(&mut canvas)
-        .map_err(|_| "Can't draw")?;
-    Rectangle::new(Point::new(0, 0), size)
-        .into_styled(style)
-        .draw(&mut canvas)
-        .map_err(|_| "Can't draw")?;
-
-    Ok(canvas)
-}
-
-fn prepare_sensor_page(
-    size: Size,
-    name: &str,
-    value: f32,
-    unit: &str,
-) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-    let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-
-    let text_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
-
-    let unit_style = MonoTextStyle::new(&FONT_10X20, Rgb565::GREEN);
-
-    let seven_segment_style = SevenSegmentStyleBuilder::new()
-        .digit_size(Size::new(20, 40))
-        .digit_spacing(2)
-        .segment_width(5)
-        .segment_color(Rgb565::GREEN)
-        .build();
-
-    let value = format!("{value:2.2}");
-    let t1 = Text::new(name, Point::zero(), text_style);
-    let t2 = Text::new(&value, Point::zero(), seven_segment_style);
-    let t3 = Text::new(unit, Point::zero(), unit_style);
-
-    let ll = LinearLayout::horizontal(Chain::new(t2).append(t3))
-        .with_alignment(vertical::Center)
-        .with_spacing(DistributeFill(size.width - 10))
-        .arrange();
-    let lv = LinearLayout::vertical(Chain::new(t1).append(ll))
-        .with_alignment(horizontal::Left)
-        .arrange();
-
-    let bounding_box = Rectangle::new(Point::new(0, 0), Size::new(size.width, size.height));
-    let rectangle_style = PrimitiveStyleBuilder::new().stroke_width(0).build();
-    let rect = Rectangle::new(Point::new(0, 0), size).into_styled(rectangle_style);
-
-    lv.align_to(&bounding_box, horizontal::Center, vertical::Center)
-        .draw(&mut canvas)?;
-    rect.draw(&mut canvas)?;
-
-    Ok(canvas)
-}
-
-fn prepare_error_page(size: Size, name: &str) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-    let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-
-    let seven_segment_style = SevenSegmentStyleBuilder::new()
-        .digit_size(Size::new(30, 40))
-        .digit_spacing(5)
-        .segment_width(5)
-        .segment_color(Rgb565::RED)
-        .build();
-
-    let t1 = Text::new(name, Point::zero(), seven_segment_style);
-
-    let ll = LinearLayout::vertical(Chain::new(t1))
-        .with_alignment(horizontal::Center)
-        .arrange();
-
-    let bounding_box = Rectangle::new(Point::new(0, 0), Size::new(size.width, size.height));
-    let rectangle_style = PrimitiveStyleBuilder::new().stroke_width(0).build();
-    let rect = Rectangle::new(Point::new(0, 0), size).into_styled(rectangle_style);
-
-    ll.align_to(&bounding_box, horizontal::Left, vertical::Center)
-        .draw(&mut canvas)?;
-    rect.draw(&mut canvas)?;
-
-    Ok(canvas)
-}
-
-
-
-
-fn prepare_noise_chart_page(size: Size, sample: &[f32]) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-    let w = size.width;
-    let h = size.height;
-    let pixel_size = <RGBPixel as PixelFormat>::EFFECTIVE_PIXEL_SIZE as u32;
-
-    let mut buffer = vec![0; (w * h * pixel_size) as usize];
-    {
-        let root = BitMapBackend::with_buffer(&mut buffer, (w, h)).into_drawing_area();
-        let mut chart_builder = ChartBuilder::on(&root);
-
-        chart_builder.margin(0);
-        chart_builder.margin_bottom(0);
-        chart_builder.margin_top(0);
-        chart_builder.set_left_and_bottom_label_area_size(0);
-        chart_builder.set_all_label_area_size(0);
-        let mut chart_context = chart_builder.build_cartesian_2d(0..sample.len() as u32, -1.0_f32..1.0_f32 )?;
-
-        chart_context.configure_mesh().disable_mesh().draw()?;
-
-        let data: Vec<(u32, f32)> = sample
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (i as u32, *s))  
-            .collect();
-        let ls = LineSeries::new(data, GREEN);
-        chart_context.draw_series(ls)?;
-        root.present()?;
-    }
-
-    let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-    
-    let mut pixel_colors = vec![];
-    for i in 0..h {
-        for j in 0..w {
-            let pos = (i * w + j) * pixel_size;
-            let colors = (
-                buffer.get(pos as usize),
-                buffer.get((pos + 1) as usize),
-                buffer.get((pos + 2) as usize),
-            );
-            if let (Some(r), Some(b), Some(g)) = colors {
-                let pixel_color = Rgb565::new(*r, *g, *b);
-                pixel_colors.push(pixel_color);
-            } else {
-                tracing::warn!("No colors at pos {i} {j} {pos}");
-            }
-        }
-    }
-    let area = Rectangle::new(Point::new(0, 0), size);
-    canvas.fill_contiguous(&area, pixel_colors)?;
-    Ok(canvas)
-}
-
-
-// fn prepare_chart_page(size: Size, sample: &[i8]) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-//     let w = size.width;
-//     let h = size.height;
-//     let pixel_size = <RGBPixel as PixelFormat>::EFFECTIVE_PIXEL_SIZE as u32;
-
-//     let mut buffer = vec![0; (w * h * pixel_size) as usize];
-//     {
-//         let root = BitMapBackend::with_buffer(&mut buffer, (w, h)).into_drawing_area();
-//         //        root.fill(&BLACK).unwrap();
-
-//         let mut chart_builder = ChartBuilder::on(&root);
-
-//         chart_builder.margin(0);
-//         chart_builder.margin_bottom(0);
-//         chart_builder.margin_top(0);
-//         chart_builder.set_left_and_bottom_label_area_size(0);
-//         chart_builder.set_all_label_area_size(0);
-//         let c = h as i32;
-//         let mut chart_context = chart_builder.build_cartesian_2d(0..320_u32, -c / 2..c / 2)?;
-
-//         chart_context.configure_mesh().disable_mesh().draw()?;
-
-//         let data: Vec<(u32, i32)> = sample
-//             .iter()
-//             .enumerate()
-//             .map(|(i, s)| (i as u32, *s as i32))
-//             //            .filter(|s| s.0 % 5 == 0)
-//             .collect();
-//         let ls = LineSeries::new(data, RED);
-//         chart_context.draw_series(ls)?;
-//         root.present()?;
-//     }
-
-//     let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-
-//     //    let mut pixels = vec![];
-//     let mut pixel_colors = vec![];
-//     for i in 0..h {
-//         for j in 0..w {
-//             let pos = (i * w + j) * pixel_size;
-//             let colors = (
-//                 buffer.get(pos as usize),
-//                 buffer.get((pos + 1) as usize),
-//                 buffer.get((pos + 2) as usize),
-//             );
-//             if let (Some(r), Some(b), Some(g)) = colors {
-//                 let pixel_color = Rgb565::new(*r, *g, *b);
-//                 //                pixels.push(Pixel(Point::new(j as i32, i as i32), pixel_color));
-//                 pixel_colors.push(pixel_color);
-//             } else {
-//                 println!("No colors at pos {i} {j} {pos}");
-//             }
-//         }
-//     }
-//     let area = Rectangle::new(Point::new(0, 0), size);
-//     canvas.fill_contiguous(&area, pixel_colors)?;
-//     //.draw_iter(pixels)?;
-//     Ok(canvas)
-// }
-
-// fn register_proximity_callback(gpio: &Gpio) -> Result<(), Box<dyn Error>> {
-//     let mut proximity = gpio.get(4)?.into_input_pullup();
-//     proximity.set_async_interrupt(Trigger::FallingEdge, |c: Level| {
-//         tracing::warn!("Got interrupt level {c:?}");
-//     })?;
-//     Ok(())
-// }
