@@ -18,8 +18,7 @@ embedded-graphics="0.8"
 embedded-graphics-core="0.4"
 embedded-layout = "0.4"
 embedded-canvas = { version = "0.2.0", git = "https://github.com/dawid-nowak/embedded-canvas"}
-portaudio = "0.7"
-#portaudio = { version = "0.7", path = "../rust-portaudio-mine"}
+portaudio = { version = "0.7", git = "https://github.com/dawid-nowak/rust-portaudio"}
 tinybmp = "0.5.0"
 eg-seven-segment = "0.2"
 plotters = {version = "0.3", default-features = false, features = ["bitmap_backend","all_series"]}
