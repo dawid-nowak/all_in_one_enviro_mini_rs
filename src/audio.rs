@@ -1,3 +1,4 @@
+use bs1770;
 use pa::DeviceIndex;
 use pa::PortAudio;
 use portaudio as pa;
@@ -147,4 +148,22 @@ where {
 
         input.ok_or(format!("No {device_name} input device connected to the enviro board").into())
     }
+}
+
+pub fn calculate_lufs(buffer: &[f32]) -> f32 {
+    let channel_samples = [buffer.clone(), buffer.clone()];
+
+    let channel_power: Vec<_> = channel_samples
+        .iter()
+        .map(|samples| {
+            let mut meter = bs1770::ChannelLoudnessMeter::new(SAMPLE_RATE);
+            meter.push(samples.iter().copied());
+            meter.into_100ms_windows()
+        })
+        .collect();
+
+    let stereo_power = bs1770::reduce_stereo(channel_power[0].as_ref(), channel_power[1].as_ref());
+
+    let gated_power = bs1770::gated_mean(stereo_power.as_ref());
+    gated_power.loudness_lkfs()
 }

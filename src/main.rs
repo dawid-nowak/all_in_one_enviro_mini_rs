@@ -26,6 +26,8 @@ const DISPLAY_SIZE_WIDTH: u32 = 160;
 const DISPLAY_SIZE_HEIGTH: u32 = 80;
 const DISPLAY_SIZE: Size = Size::new(DISPLAY_SIZE_WIDTH, DISPLAY_SIZE_HEIGTH);
 const PROXIMITY_TRESHOLD: u16 = 1500;
+const LUFS_WINDOW: usize = (audio::FRAMES * 64) as usize;
+const NOISE_WINDOW: usize = (audio::FRAMES * 10) as usize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
@@ -45,8 +47,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pages = pages::Pages::new(DISPLAY_SIZE);
     let mut sensors = Sensors::new()?;
 
-    let mut rb = AllocRingBuffer::new(audio::FRAMES as usize);
+    let mut rb = AllocRingBuffer::new(NOISE_WINDOW);
     rb.fill(0.0_f32);
+
+    let mut power_rb = AllocRingBuffer::new(LUFS_WINDOW);
+    power_rb.fill(0.0_f32);
+
     let buffer_producer = Arc::new(Mutex::new(rb));
     let buffer_consumer = buffer_producer.clone();
 
@@ -94,6 +100,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             if let Some(proximity) = proximity {
                 let default_page = PageTypes::All((pressure, temperature, humidity, brightness));
                 if proximity > PROXIMITY_TRESHOLD {
+                    audio.stop_audio();
+                    power_rb.clear();
+                    power_rb.fill(0.0);
+                    if let Ok(mut buf) = buffer_consumer.lock() {
+                        buf.clear();
+                        buf.fill(0.0);
+                    }
                     page_selector = match page_selector {
                         PageTypes::All(_) => PageTypes::Temperature(temperature),
                         PageTypes::Temperature(_) => PageTypes::Pressure(pressure),
@@ -108,7 +121,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 } else {
                                     vec![]
                                 };
-                                PageTypes::Noise(data)
+                                power_rb.extend(data.clone());
+                                let lufs = audio::calculate_lufs(&power_rb.to_vec());
+                                PageTypes::Noise((data, Some(lufs)))
                             }
                         }
                         PageTypes::Noise(_) => default_page,
@@ -116,7 +131,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         PageTypes::Boot => default_page,
                     };
                     tracing::info!("Selected page {page_selector}");
-                    audio.stop_audio();
                 } else {
                     page_selector = match page_selector {
                         PageTypes::All(_) => default_page,
@@ -133,7 +147,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 } else {
                                     vec![]
                                 };
-                                PageTypes::Noise(data)
+                                power_rb.extend(data.clone());
+                                let lufs = audio::calculate_lufs(&power_rb.to_vec());
+                                PageTypes::Noise((data, Some(lufs)))
                             }
                         }
                         PageTypes::Error(_) => default_page,

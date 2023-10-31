@@ -1,6 +1,8 @@
+use core::fmt;
 use eg_seven_segment::SevenSegmentStyleBuilder;
 use embedded_canvas::Canvas;
 use embedded_graphics::geometry::Size;
+use embedded_graphics::image::Image;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::pixelcolor::RgbColor;
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
@@ -9,7 +11,6 @@ use embedded_graphics::{
     mono_font::{iso_8859_16::FONT_10X20, iso_8859_16::FONT_6X10, MonoTextStyle},
     prelude::*,
 };
-use embedded_graphics::image::Image;
 use embedded_layout::layout::linear::spacing::DistributeFill;
 use embedded_layout::{layout::linear::LinearLayout, prelude::*};
 use plotters::backend::PixelFormat;
@@ -20,46 +21,43 @@ use plotters::prelude::IntoDrawingArea;
 use plotters::series::LineSeries;
 use plotters::style::GREEN;
 use std::error::Error;
-use core::fmt;
 use tinybmp::Bmp;
 
 #[derive(Clone)]
 pub enum PageTypes {
-    All((f32,f32,f32, Option<f32>)),
+    All((f32, f32, f32, Option<f32>)),
     Temperature(f32),
     Pressure(f32),
     Humidity(f32),
     Brightness(Option<f32>),
-    Noise(Vec<f32>),
+    Noise((Vec<f32>, Option<f32>)),
     Error(&'static str),
-    Boot
+    Boot,
 }
-
 
 impl fmt::Display for PageTypes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	let desc = match self{
-	    Self::All(_) => "All",
-	    Self::Temperature(_) => "Temperature",
-	    Self::Pressure(_) => "Pressure",
-	    Self::Humidity(_) => "Humidity",
-	    Self::Brightness(_) => "Brightness",
-	    Self::Noise(_) => "Noise",
-	    Self::Error(_) => "Error",
-	    Self::Boot => "Boot"
-	};	    
+        let desc = match self {
+            Self::All(_) => "All",
+            Self::Temperature(_) => "Temperature",
+            Self::Pressure(_) => "Pressure",
+            Self::Humidity(_) => "Humidity",
+            Self::Brightness(_) => "Brightness",
+            Self::Noise(_) => "Noise",
+            Self::Error(_) => "Error",
+            Self::Boot => "Boot",
+        };
         write!(f, "PageTypes({desc})")
     }
 }
-
 
 pub struct Pages {
     size: Size,
 }
 
 impl Pages {
-    pub fn new(size: Size)->Self{
-	Self{size}
+    pub fn new(size: Size) -> Self {
+        Self { size }
     }
     pub fn draw_page(&self, page_selector: &PageTypes) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
         match page_selector {
@@ -82,18 +80,14 @@ impl Pages {
             PageTypes::Brightness(lux) => {
                 Self::prepare_sensor_page(self.size, "Brightness", lux.unwrap_or(f32::NAN), "lux")
             }
-            PageTypes::Noise(data) => {               
-                    Self::prepare_noise_chart_page(self.size, &data)
+            PageTypes::Noise((data, lufs)) => {
+                Self::prepare_noise_chart_page(self.size, data, *lufs)
             }
-            PageTypes::Error(msg) => 
-                Self::prepare_error_page(self.size, msg),
-	    
-            PageTypes::Boot => 
-                Self::prepare_boot_page(self.size),
-        }	
-    }
+            PageTypes::Error(msg) => Self::prepare_error_page(self.size, msg),
 
-    
+            PageTypes::Boot => Self::prepare_boot_page(self.size),
+        }
+    }
 
     pub fn prepare_all_sensors_page(
         size: Size,
@@ -250,10 +244,12 @@ impl Pages {
     fn prepare_noise_chart_page(
         size: Size,
         sample: &[f32],
+        lufs: Option<f32>,
     ) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
         let w = size.width;
         let h = size.height;
         let pixel_size = <RGBPixel as PixelFormat>::EFFECTIVE_PIXEL_SIZE as u32;
+        let sample = sample.iter().map(|s| 2.0 * ((4.0 * s).tanh()));
 
         let mut buffer = vec![0; (w * h * pixel_size) as usize];
         {
@@ -266,15 +262,11 @@ impl Pages {
             chart_builder.set_left_and_bottom_label_area_size(0);
             chart_builder.set_all_label_area_size(0);
             let mut chart_context =
-                chart_builder.build_cartesian_2d(0..sample.len() as u32, -1.0_f32..1.0_f32)?;
+                chart_builder.build_cartesian_2d(0..sample.len() as u32, -2.0_f32..2.0_f32)?;
 
             chart_context.configure_mesh().disable_mesh().draw()?;
 
-            let data: Vec<(u32, f32)> = sample
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (i as u32, *s))
-                .collect();
+            let data: Vec<(u32, f32)> = sample.enumerate().map(|(i, s)| (i as u32, s)).collect();
             let ls = LineSeries::new(data, GREEN);
             chart_context.draw_series(ls)?;
             root.present()?;
@@ -299,22 +291,36 @@ impl Pages {
                 }
             }
         }
+        let style = MonoTextStyle::new(&FONT_10X20, Rgb565::GREEN);
         let area = Rectangle::new(Point::new(0, 0), size);
         canvas.fill_contiguous(&area, pixel_colors)?;
+        if let Some(lufs) = lufs {
+            let bounding_box = Rectangle::new(Point::new(5, 5), Size::new(size.width - 5, 25));
+            let text1 = Text::new("LUFS:", Point::zero(), style);
+            let value = format!("{:9.2}", lufs);
+            let text2 = Text::new(&value, Point::zero(), style);
+            let ll = LinearLayout::horizontal(Chain::new(text1).append(text2))
+                .with_alignment(vertical::Center)
+                .with_spacing(DistributeFill(size.width - 10))
+                .arrange();
+            ll.align_to(&bounding_box, horizontal::Left, vertical::Center)
+                .draw(&mut canvas)?;
+        }
+
         Ok(canvas)
     }
 
     fn prepare_boot_page(size: Size) -> Result<Canvas<Rgb565>, Box<dyn Error>> {
-	let rust_logo = include_bytes!("./rust-logo_80x80.bmp");
-	let pimoroni_logo = include_bytes!("./pimoroni-logo_80x80.bmp");
-	let rust_image =
+        let rust_logo = include_bytes!("./rust-logo_80x80.bmp");
+        let pimoroni_logo = include_bytes!("./pimoroni-logo_80x80.bmp");
+        let rust_image =
             Bmp::from_slice(rust_logo).map_err(|e| format!("Can't open Rust image {:?}", e))?;
-	let pimoroni_image =
-        Bmp::from_slice(pimoroni_logo).map_err(|e| format!("Can't open Pimoroni image {:?}", e))?;
-	let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
-	
-	Image::new(&rust_image, Point::new(0, 0)).draw(&mut canvas)?;
-	Image::new(&pimoroni_image, Point::new(80, 0)).draw(&mut canvas)?;
-	Ok(canvas)
+        let pimoroni_image = Bmp::from_slice(pimoroni_logo)
+            .map_err(|e| format!("Can't open Pimoroni image {:?}", e))?;
+        let mut canvas = Canvas::with_default_color(size, Rgb565::BLACK);
+
+        Image::new(&rust_image, Point::new(0, 0)).draw(&mut canvas)?;
+        Image::new(&pimoroni_image, Point::new(80, 0)).draw(&mut canvas)?;
+        Ok(canvas)
     }
 }
