@@ -6,6 +6,7 @@ use embedded_graphics::prelude::*;
 use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::digital::v2::PinState;
 use rppal::gpio::Gpio;
+
 use rppal::hal::Delay;
 use rppal::spi::Bus;
 use rppal::spi::Mode as SPIMode;
@@ -20,12 +21,13 @@ use std::thread;
 use systemstat::Duration;
 
 const DC_PIN: u8 = 9;
+const BACKLIGHT_PIN: u8 = 12;
 const SPI_SPEED: u32 = 10_000_000;
 const DISPLAY_HORIZONTAL_OFFSET: i32 = 0;
 const DISPLAY_VERTICAL_OFFSET: i32 = 25;
 const DISPLAY_OFFSET: Point = Point::new(DISPLAY_HORIZONTAL_OFFSET, DISPLAY_VERTICAL_OFFSET);
-const BACKLIGHT_PIN: u8 = 12;
-
+const DISPLAY_PHYSICAL_SIZE_WIDTH: u32 = 162;
+const DISPLAY_PHYSICAL_SIZE_HEIGHT: u32 = 132;
 struct NotConnected;
 
 impl OutputPin for NotConnected {
@@ -56,7 +58,15 @@ impl Display {
         let spi = Spi::new(Bus::Spi0, SlaveSelect::Ss1, SPI_SPEED, SPIMode::Mode0)?;
 
         let dc = gpio.get(DC_PIN)?.into_output();
-        let mut display = ST7735::new(spi, dc, NotConnected, false, true, 162, 132);
+        let mut display = ST7735::new(
+            spi,
+            dc,
+            NotConnected,
+            false,
+            true,
+            DISPLAY_PHYSICAL_SIZE_WIDTH,
+            DISPLAY_PHYSICAL_SIZE_HEIGHT,
+        );
         display
             .init(&mut delay)
             .map_err(|_| "Can't initialize the display")?;
@@ -95,12 +105,20 @@ impl Display {
         }
     }
 
-    pub fn screen_on(gpio: &Gpio) -> Result<(), Box<dyn Error>> {
+    pub fn screen_on(gpio: &Gpio) -> Result<rppal::gpio::OutputPin, Box<dyn Error>> {
         let mut backlight = gpio.get(BACKLIGHT_PIN)?.into_output();
         backlight.set_low();
         thread::sleep(Duration::from_millis(100));
         backlight.set_high();
         thread::sleep(Duration::from_millis(100));
-        Ok(())
+        Ok(backlight)
+    }
+
+    pub fn screen_off(
+        mut backlight: rppal::gpio::OutputPin,
+    ) -> Result<rppal::gpio::OutputPin, Box<dyn Error>> {
+        backlight.set_low();
+        thread::sleep(Duration::from_millis(100));
+        Ok(backlight)
     }
 }

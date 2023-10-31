@@ -126,11 +126,9 @@ where {
         tracing::debug!("Input device info {device_name}: {:#?}", &input_info);
 
         // Construct the input stream parameters.
-        tracing::debug!("Input params ?");
         let latency = input_info.default_low_input_latency;
         let input_params =
             pa::StreamParameters::<f32>::new(input_dev, CHANNELS.into(), INTERLEAVED, latency);
-        tracing::debug!("Format supported ?");
         pa.is_input_format_supported(input_params, SAMPLE_RATE.into())?;
         let settings = pa::InputStreamSettings::new(input_params, SAMPLE_RATE.into(), FRAMES);
         Ok((pa, settings))

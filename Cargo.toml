@@ -22,10 +22,11 @@ embedded-layout = "0.4"
 embedded-canvas = { version = "0.2.0", path = "../embedded-canvas"}
 portaudio = { version = "0.7", path = "../rust-portaudio"}
 tinybmp = "0.5.0"
-ctrlc = "*"
+#ctrlc = "*"
 eg-seven-segment = "0.2"
 plotters = {version = "0.3", default-features = false, features = ["bitmap_backend","all_series"]}
 rand = "0.8"
 ringbuffer = "0.15"
 timer = "0.2"
 chrono = "0.4"
+signal-hook = "0.3"
