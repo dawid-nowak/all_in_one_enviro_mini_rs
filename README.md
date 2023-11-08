@@ -4,3 +4,7 @@ Pet project to re-write [enviroplus-python](https://github.com/pimoroni/enviropl
 ## Demo
 <video controls='false' src='https://github.com/dawid-nowak/all_in_one_enviro_mini_rs/assets/25728428/4c16a75c-0992-4a18-a483-abaebe431953' width=180/>
 
+
+## Demo
+<video controls='false' src='https://github.com/dawid-nowak/all_in_one_enviro_mini_rs/assets/RustPimoroni_small.mp4' width=180/>
+
