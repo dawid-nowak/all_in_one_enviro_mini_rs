@@ -3,6 +3,6 @@
 Pet project to re-write [enviroplus-python](https://github.com/pimoroni/enviroplus-python) in Rust
 
 ## Demo
-[Watch the demo](./assets/RustPimoroni.mp4)
+<video src='./assets/RustPimoroni.mp4' width=180/>
 
 
