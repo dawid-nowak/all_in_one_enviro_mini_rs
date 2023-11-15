@@ -11,13 +11,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bme280 = "0.3.0"
 systemstat = "0.2.3"
-ltr-559 = {version= "0.1.1", git = "https://github.com/dawid-nowak/ltr-559"}
+ltr-559 = {version= "0.1.1", git = "https://github.com/iohe/ltr-559", rev = "e27591fbc07675e4d41e4cfa4b847f09b9db7dab"}
 st7735-lcd = "0.9.0"
 embedded-hal = "0.2.5"
 embedded-graphics="0.8"
 embedded-graphics-core="0.4"
 embedded-layout = "0.4"
-embedded-canvas = { version = "0.2.0", git = "https://github.com/dawid-nowak/embedded-canvas"}
+embedded-canvas = { version = "0.3"}
 portaudio = { version = "0.7", git = "https://github.com/dawid-nowak/rust-portaudio"}
 tinybmp = "0.5.0"
 eg-seven-segment = "0.2"
